@@ -34,6 +34,7 @@ import (
 	"io"
 
 	"gitlab.com/yawning/obfs4.git/common/drbg"
+	"gitlab.com/yawning/obfs4.git/common/log"
 	"gitlab.com/yawning/obfs4.git/transports/obfs4/framing"
 )
 
@@ -108,10 +109,13 @@ func (conn *obfs4Conn) makePacket(w io.Writer, pktType uint8, data []byte, padLe
 	return nil
 }
 
-func (conn *obfs4Conn) readPackets() (err error) {
+func (conn *obfs4Conn) readPackets() (numPkts int, err error) {
 	// Attempt to read off the network.
+    log.Debugf("Attempting to read...")
 	rdLen, rdErr := conn.Conn.Read(conn.readBuffer)
 	conn.receiveBuffer.Write(conn.readBuffer[:rdLen])
+    log.Debugf("Successfully read!")
+    numPkts = 0
 
 	var decoded [framing.MaximumFramePayloadLength]byte
 	for conn.receiveBuffer.Len() > 0 {
@@ -163,12 +167,13 @@ func (conn *obfs4Conn) readPackets() (err error) {
 		default:
 			// Ignore unknown packet types.
 		}
+        numPkts++;
 	}
 
 	// Read errors (all fatal) take priority over various frame processing
 	// errors.
 	if rdErr != nil {
-		return rdErr
+		return numPkts, rdErr
 	}
 
 	return

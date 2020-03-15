@@ -43,6 +43,7 @@ import (
 	"time"
 
 	"git.torproject.org/pluggable-transports/goptlib.git"
+	"gitlab.com/yawning/obfs4.git/common/log"
 	"gitlab.com/yawning/obfs4.git/common/drbg"
 	"gitlab.com/yawning/obfs4.git/common/ntor"
 	"gitlab.com/yawning/obfs4.git/common/probdist"
@@ -69,6 +70,8 @@ const (
 	serverHandshakeTimeout = time.Duration(30) * time.Second
 	replayTTL              = time.Duration(3) * time.Hour
 
+    bufferCheck            = time.Duration(100) * time.Millisecond
+
 	maxIATDelay   = 100
 	maxCloseDelay = 60
 )
@@ -77,6 +80,7 @@ const (
 	iatNone = iota
 	iatEnabled
 	iatParanoid
+    iatDF
 )
 
 // biasedDist controls if the probability table will be ScrambleSuit style or
@@ -101,6 +105,7 @@ func (t *Transport) Name() string {
 // ClientFactory returns a new obfs4ClientFactory instance.
 func (t *Transport) ClientFactory(stateDir string) (base.ClientFactory, error) {
 	cf := &obfs4ClientFactory{transport: t}
+    log.Debugf("ClientFactory returning")
 	return cf, nil
 }
 
@@ -191,9 +196,17 @@ func (cf *obfs4ClientFactory) ParseArgs(args *pt.Args) (interface{}, error) {
 		return nil, fmt.Errorf("missing argument '%s'", iatArg)
 	}
 	iatMode, err := strconv.Atoi(iatStr)
-	if err != nil || iatMode < iatNone || iatMode > iatParanoid {
+	if err != nil || iatMode < iatNone || iatMode > iatDF {
 		return nil, fmt.Errorf("invalid iat-mode '%d'", iatMode)
 	}
+
+    if iatMode == iatParanoid {
+        log.Debugf("IAT mode set to paranoid")
+    }
+
+    if iatMode == iatDF {
+        log.Debugf("IAT mode set to DynaFlow")
+    }
 
 	// Generate the session key pair before connectiong to hide the Elligator2
 	// rejection sampling from network observers.
@@ -265,7 +278,9 @@ func (sf *obfs4ServerFactory) WrapConn(conn net.Conn) (net.Conn, error) {
 		iatDist = probdist.New(sf.iatSeed, 0, maxIATDelay, biasedDist)
 	}
 
-	c := &obfs4Conn{conn, true, lenDist, iatDist, sf.iatMode, bytes.NewBuffer(nil), bytes.NewBuffer(nil), make([]byte, consumeReadSize), nil, nil}
+	c := &obfs4Conn{conn, true, lenDist, iatDist, sf.iatMode, bytes.NewBuffer(nil), bytes.NewBuffer(nil), make([]byte, consumeReadSize),
+    bytes.NewBuffer(nil),
+    nil, nil}
 
 	startTime := time.Now()
 
@@ -290,6 +305,9 @@ type obfs4Conn struct {
 	receiveDecodedBuffer *bytes.Buffer
 	readBuffer           []byte
 
+    // For DynaFlow
+    writeBuffer          *bytes.Buffer
+
 	encoder *framing.Encoder
 	decoder *framing.Decoder
 }
@@ -312,7 +330,11 @@ func newObfs4ClientConn(conn net.Conn, args *obfs4ClientArgs) (c *obfs4Conn, err
 	}
 
 	// Allocate the client structure.
-	c = &obfs4Conn{conn, false, lenDist, iatDist, args.iatMode, bytes.NewBuffer(nil), bytes.NewBuffer(nil), make([]byte, consumeReadSize), nil, nil}
+	c = &obfs4Conn{
+        conn, false, lenDist, iatDist, args.iatMode,
+        bytes.NewBuffer(nil), bytes.NewBuffer(nil), make([]byte, consumeReadSize),
+        bytes.NewBuffer(nil), // writeBuffer
+        nil, nil}
 
 	// Start the handshake timeout.
 	deadline := time.Now().Add(clientHandshakeTimeout)
@@ -346,6 +368,10 @@ func (conn *obfs4Conn) clientHandshake(nodeID *ntor.NodeID, peerIdentityKey *nto
 	if _, err = conn.Conn.Write(blob); err != nil {
 		return err
 	}
+
+    if conn.iatMode == iatDF {
+        go conn.StartDispatcher()
+    }
 
 	// Consume the server handshake.
 	var hsBuf [maxHandshakeLength]byte
@@ -447,12 +473,15 @@ func (conn *obfs4Conn) serverHandshake(sf *obfs4ServerFactory, sessionKey *ntor.
 	return nil
 }
 
+var jammed bool = false
+
 func (conn *obfs4Conn) Read(b []byte) (n int, err error) {
 	// If there is no payload from the previous Read() calls, consume data off
 	// the network.  Not all data received is guaranteed to be usable payload,
 	// so do this in a loop till data is present or an error occurs.
+    var numPkts int
 	for conn.receiveDecodedBuffer.Len() == 0 {
-		err = conn.readPackets()
+		numPkts, err = conn.readPackets()
 		if err == framing.ErrAgain {
 			// Don't proagate this back up the call stack if we happen to break
 			// out of the loop.
@@ -462,6 +491,8 @@ func (conn *obfs4Conn) Read(b []byte) (n int, err error) {
 			break
 		}
 	}
+
+    jammed = false
 
 	// Even if err is set, attempt to do the read anyway so that all decoded
 	// data gets relayed before the connection is torn down.
@@ -475,13 +506,116 @@ func (conn *obfs4Conn) Read(b []byte) (n int, err error) {
 		}
 	}
 
+    log.Debugf("Read %d bytes", n)
+    if conn.iatMode == iatDF {
+        conn.Dispatch(numPkts * 4);
+    }
+
 	return
 }
 
+func (conn *obfs4Conn) StartDispatcher() {
+    for {
+        // log.Debugf("Checking buffer every 100ms...")
+        if jammed {
+            log.Warnf("!!! Jammed! Dispatching all packets")
+            conn.Dispatch(0) // dispatch a single packet if we're jammed
+        }
+        if conn.writeBuffer.Len() > 0 {
+            jammed = true
+        }
+        time.Sleep(bufferCheck)
+    }
+}
+
+func (conn *obfs4Conn) Dispatch(numPkts int) (err error) {
+    if numPkts == 0 {
+        log.Debugf("Dispatching all packets")
+        _, err = conn.Conn.Write(conn.writeBuffer.Bytes())
+        conn.writeBuffer.Reset()
+        return
+    }
+
+    log.Debugf("Dispatching %d packets", numPkts);
+    var iatFrame [framing.MaximumSegmentLength]byte
+    n := 0
+    // conn.padBurst(conn.writeBuffer, numPkts * framing.MaximumSegmentLength)
+    for numPkts > 0 {
+        // similar to regular IAT mode
+        n, err = conn.writeBuffer.Read(iatFrame[:])
+        if err != nil { return err }
+        _, err = conn.Conn.Write(iatFrame[:n])
+        if err != nil { return err }
+
+        if n < framing.MaximumSegmentLength {
+            log.Warnf("Could not find enough data to write!")
+        }
+        numPkts--;
+    }
+    return
+}
+
+func (conn *obfs4Conn) SendWithIAT(iatMode int, frameBuf *bytes.Buffer) (err error) {
+    var iatFrame [framing.MaximumSegmentLength]byte
+    for frameBuf.Len() > 0 {
+        iatWrLen := 0
+
+        switch iatMode {
+        case iatEnabled:
+            // Standard (ScrambleSuit-style) IAT obfuscation optimizes for
+            // bulk transport and will write ~MTU sized frames when
+            // possible.
+            iatWrLen, err = frameBuf.Read(iatFrame[:])
+
+        case iatParanoid:
+            // Paranoid IAT obfuscation throws performance out of the
+            // window and will sample the length distribution every time a
+            // write is scheduled.
+            targetLen := conn.lenDist.Sample()
+            if frameBuf.Len() < targetLen {
+                // There's not enough data buffered for the target write,
+                // so padding must be inserted.
+                if err = conn.padBurst(frameBuf, targetLen); err != nil {
+                    return err
+                }
+                if frameBuf.Len() != targetLen {
+                    // Ugh, padding came out to a value that required more
+                    // than one frame, this is relatively unlikely so just
+                    // resample since there's enough data to ensure that
+                    // the next sample will be written.
+                    continue
+                }
+            }
+            iatWrLen, err = frameBuf.Read(iatFrame[:targetLen])
+        }
+
+        if err != nil {
+            return err
+        } else if iatWrLen == 0 {
+            panic(fmt.Sprintf("BUG: Write(), iat length was 0"))
+        }
+
+        log.Debugf("Sending packet of iatWrLen %d", iatWrLen)
+
+        // Calculate the delay.  The delay resolution is 100 usec, leading
+        // to a maximum delay of 10 msec.
+        iatDelta := time.Duration(conn.iatDist.Sample() * 100)
+
+        // Write then sleep.
+        _, err = conn.Conn.Write(iatFrame[:iatWrLen])
+        if err != nil {
+            return err
+        }
+        time.Sleep(iatDelta * time.Microsecond)
+    }
+    return
+}
 func (conn *obfs4Conn) Write(b []byte) (n int, err error) {
 	chopBuf := bytes.NewBuffer(b)
 	var payload [maxPacketPayloadLength]byte
 	var frameBuf bytes.Buffer
+
+    log.Debugf("Writing %d bytes", len(b));
 
 	// Chop the pending data into payload frames.
 	for chopBuf.Len() > 0 {
@@ -514,55 +648,13 @@ func (conn *obfs4Conn) Write(b []byte) (n int, err error) {
 	// frameBuf around.  In theory, write timeouts and whatnot could be
 	// supported if this wasn't the case, but that complicates the code.
 	if conn.iatMode != iatNone {
-		var iatFrame [framing.MaximumSegmentLength]byte
-		for frameBuf.Len() > 0 {
-			iatWrLen := 0
-
-			switch conn.iatMode {
-			case iatEnabled:
-				// Standard (ScrambleSuit-style) IAT obfuscation optimizes for
-				// bulk transport and will write ~MTU sized frames when
-				// possible.
-				iatWrLen, err = frameBuf.Read(iatFrame[:])
-
-			case iatParanoid:
-				// Paranoid IAT obfuscation throws performance out of the
-				// window and will sample the length distribution every time a
-				// write is scheduled.
-				targetLen := conn.lenDist.Sample()
-				if frameBuf.Len() < targetLen {
-					// There's not enough data buffered for the target write,
-					// so padding must be inserted.
-					if err = conn.padBurst(&frameBuf, targetLen); err != nil {
-						return 0, err
-					}
-					if frameBuf.Len() != targetLen {
-						// Ugh, padding came out to a value that required more
-						// than one frame, this is relatively unlikely so just
-						// resample since there's enough data to ensure that
-						// the next sample will be written.
-						continue
-					}
-				}
-				iatWrLen, err = frameBuf.Read(iatFrame[:targetLen])
-			}
-			if err != nil {
-				return 0, err
-			} else if iatWrLen == 0 {
-				panic(fmt.Sprintf("BUG: Write(), iat length was 0"))
-			}
-
-			// Calculate the delay.  The delay resolution is 100 usec, leading
-			// to a maximum delay of 10 msec.
-			iatDelta := time.Duration(conn.iatDist.Sample() * 100)
-
-			// Write then sleep.
-			_, err = conn.Conn.Write(iatFrame[:iatWrLen])
-			if err != nil {
-				return 0, err
-			}
-			time.Sleep(iatDelta * time.Microsecond)
-		}
+        if conn.iatMode == iatDF {
+            // Buffer everything, wait to send
+            conn.writeBuffer.Write(frameBuf.Bytes())
+            log.Debugf("Successfully buffered %d bytes", frameBuf.Len())
+        } else if err = conn.SendWithIAT(conn.iatMode, &frameBuf); err != nil {
+            return 0, err
+        }
 	} else {
 		_, err = conn.Conn.Write(frameBuf.Bytes())
 	}
