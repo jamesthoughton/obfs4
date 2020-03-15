@@ -34,6 +34,7 @@ import (
     "crypto/sha256"
     "flag"
     "fmt"
+    "sync"
     "io"
     "io/ioutil"
     "math/rand"
@@ -278,9 +279,18 @@ func (sf *obfs4ServerFactory) WrapConn(conn net.Conn) (net.Conn, error) {
         iatDist = probdist.New(sf.iatSeed, 0, maxIATDelay, biasedDist)
     }
 
-    c := &obfs4Conn{conn, true, lenDist, iatDist, sf.iatMode, bytes.NewBuffer(nil), bytes.NewBuffer(nil), make([]byte, consumeReadSize),
-    bytes.NewBuffer(nil),
-    nil, nil}
+    c := &obfs4Conn{
+        Conn: conn,
+        isServer: true,
+        lenDist: lenDist,
+        iatDist: iatDist,
+        iatMode: sf.iatMode,
+        receiveBuffer: bytes.NewBuffer(nil),
+        receiveDecodedBuffer: bytes.NewBuffer(nil),
+        readBuffer: make([]byte, consumeReadSize),
+        writeBuffer: bytes.NewBuffer(nil),
+        jammed: true,
+    }
 
     startTime := time.Now()
 
@@ -307,9 +317,12 @@ type obfs4Conn struct {
 
     // For DynaFlow
     writeBuffer          *bytes.Buffer
+    jammed               bool
 
     encoder *framing.Encoder
     decoder *framing.Decoder
+
+    writeBufferLock      sync.Mutex
 }
 
 func newObfs4ClientConn(conn net.Conn, args *obfs4ClientArgs) (c *obfs4Conn, err error) {
@@ -331,401 +344,410 @@ func newObfs4ClientConn(conn net.Conn, args *obfs4ClientArgs) (c *obfs4Conn, err
 
     // Allocate the client structure.
     c = &obfs4Conn{
-        conn, false, lenDist, iatDist, args.iatMode,
-        bytes.NewBuffer(nil), bytes.NewBuffer(nil), make([]byte, consumeReadSize),
-        bytes.NewBuffer(nil), // writeBuffer
-        nil, nil}
-
-        // Start the handshake timeout.
-        deadline := time.Now().Add(clientHandshakeTimeout)
-        if err = conn.SetDeadline(deadline); err != nil {
-            return nil, err
-        }
-
-        if err = c.clientHandshake(args.nodeID, args.publicKey, args.sessionKey); err != nil {
-            return nil, err
-        }
-
-        // Stop the handshake timeout.
-        if err = conn.SetDeadline(time.Time{}); err != nil {
-            return nil, err
-        }
-
-        return
+        Conn: conn,
+        isServer: false,
+        lenDist: lenDist,
+        iatDist: iatDist,
+        iatMode: args.iatMode,
+        receiveBuffer: bytes.NewBuffer(nil),
+        receiveDecodedBuffer: bytes.NewBuffer(nil),
+        readBuffer: make([]byte, consumeReadSize),
+        writeBuffer: bytes.NewBuffer(nil),
+        jammed: true,
     }
 
-    func (conn *obfs4Conn) clientHandshake(nodeID *ntor.NodeID, peerIdentityKey *ntor.PublicKey, sessionKey *ntor.Keypair) error {
-        if conn.isServer {
-            return fmt.Errorf("clientHandshake called on server connection")
-        }
-
-        // Generate and send the client handshake.
-        hs := newClientHandshake(nodeID, peerIdentityKey, sessionKey)
-        blob, err := hs.generateHandshake()
-        if err != nil {
-            return err
-        }
-        if _, err = conn.Conn.Write(blob); err != nil {
-            return err
-        }
-
-        if conn.iatMode == iatDF {
-            go conn.StartDispatcher()
-        }
-
-        // Consume the server handshake.
-        var hsBuf [maxHandshakeLength]byte
-        for {
-            n, err := conn.Conn.Read(hsBuf[:])
-            if err != nil {
-                // The Read() could have returned data and an error, but there is
-                // no point in continuing on an EOF or whatever.
-                return err
-            }
-            conn.receiveBuffer.Write(hsBuf[:n])
-
-            n, seed, err := hs.parseServerHandshake(conn.receiveBuffer.Bytes())
-            if err == ErrMarkNotFoundYet {
-                continue
-            } else if err != nil {
-                return err
-            }
-            _ = conn.receiveBuffer.Next(n)
-
-            // Use the derived key material to intialize the link crypto.
-            okm := ntor.Kdf(seed, framing.KeyLength*2)
-            conn.encoder = framing.NewEncoder(okm[:framing.KeyLength])
-            conn.decoder = framing.NewDecoder(okm[framing.KeyLength:])
-
-            return nil
-        }
+    // Start the handshake timeout.
+    deadline := time.Now().Add(clientHandshakeTimeout)
+    if err = conn.SetDeadline(deadline); err != nil {
+        return nil, err
     }
 
-    func (conn *obfs4Conn) serverHandshake(sf *obfs4ServerFactory, sessionKey *ntor.Keypair) error {
-        if !conn.isServer {
-            return fmt.Errorf("serverHandshake called on client connection")
-        }
+    if err = c.clientHandshake(args.nodeID, args.publicKey, args.sessionKey); err != nil {
+        return nil, err
+    }
 
-        // Generate the server handshake, and arm the base timeout.
-        hs := newServerHandshake(sf.nodeID, sf.identityKey, sessionKey)
-        if err := conn.Conn.SetDeadline(time.Now().Add(serverHandshakeTimeout)); err != nil {
-            return err
-        }
+    // Stop the handshake timeout.
+    if err = conn.SetDeadline(time.Time{}); err != nil {
+        return nil, err
+    }
 
-        // Consume the client handshake.
-        var hsBuf [maxHandshakeLength]byte
-        for {
-            n, err := conn.Conn.Read(hsBuf[:])
-            if err != nil {
-                // The Read() could have returned data and an error, but there is
-                // no point in continuing on an EOF or whatever.
-                return err
-            }
-            conn.receiveBuffer.Write(hsBuf[:n])
+    return
+}
 
-            seed, err := hs.parseClientHandshake(sf.replayFilter, conn.receiveBuffer.Bytes())
-            if err == ErrMarkNotFoundYet {
-                continue
-            } else if err != nil {
-                return err
-            }
-            conn.receiveBuffer.Reset()
+func (conn *obfs4Conn) clientHandshake(nodeID *ntor.NodeID, peerIdentityKey *ntor.PublicKey, sessionKey *ntor.Keypair) error {
+    if conn.isServer {
+        return fmt.Errorf("clientHandshake called on server connection")
+    }
 
-            if err := conn.Conn.SetDeadline(time.Time{}); err != nil {
-                return nil
-            }
+    // Generate and send the client handshake.
+    hs := newClientHandshake(nodeID, peerIdentityKey, sessionKey)
+    blob, err := hs.generateHandshake()
+    if err != nil {
+        return err
+    }
+    if _, err = conn.Conn.Write(blob); err != nil {
+        return err
+    }
 
-            // Use the derived key material to intialize the link crypto.
-            okm := ntor.Kdf(seed, framing.KeyLength*2)
-            conn.encoder = framing.NewEncoder(okm[framing.KeyLength:])
-            conn.decoder = framing.NewDecoder(okm[:framing.KeyLength])
+    if conn.iatMode == iatDF {
+        go conn.StartDispatcher()
+    }
 
-            break
-        }
-
-        // Since the current and only implementation always sends a PRNG seed for
-        // the length obfuscation, this makes the amount of data received from the
-        // server inconsistent with the length sent from the client.
-        //
-        // Rebalance this by tweaking the client mimimum padding/server maximum
-        // padding, and sending the PRNG seed unpadded (As in, treat the PRNG seed
-        // as part of the server response).  See inlineSeedFrameLength in
-        // handshake_ntor.go.
-
-        // Generate/send the response.
-        blob, err := hs.generateHandshake()
+    // Consume the server handshake.
+    var hsBuf [maxHandshakeLength]byte
+    for {
+        n, err := conn.Conn.Read(hsBuf[:])
         if err != nil {
+            // The Read() could have returned data and an error, but there is
+            // no point in continuing on an EOF or whatever.
             return err
         }
-        var frameBuf bytes.Buffer
-        if _, err = frameBuf.Write(blob); err != nil {
-            return err
-        }
+        conn.receiveBuffer.Write(hsBuf[:n])
 
-        // Send the PRNG seed as the first packet.
-        if err := conn.makePacket(&frameBuf, packetTypePrngSeed, sf.lenSeed.Bytes()[:], 0); err != nil {
+        n, seed, err := hs.parseServerHandshake(conn.receiveBuffer.Bytes())
+        if err == ErrMarkNotFoundYet {
+            continue
+        } else if err != nil {
             return err
         }
-        if _, err = conn.Conn.Write(frameBuf.Bytes()); err != nil {
-            return err
-        }
+        _ = conn.receiveBuffer.Next(n)
+
+        // Use the derived key material to intialize the link crypto.
+        okm := ntor.Kdf(seed, framing.KeyLength*2)
+        conn.encoder = framing.NewEncoder(okm[:framing.KeyLength])
+        conn.decoder = framing.NewDecoder(okm[framing.KeyLength:])
 
         return nil
     }
+}
 
-    var jammed bool = false
+func (conn *obfs4Conn) serverHandshake(sf *obfs4ServerFactory, sessionKey *ntor.Keypair) error {
+    if !conn.isServer {
+        return fmt.Errorf("serverHandshake called on client connection")
+    }
 
-    func (conn *obfs4Conn) Read(b []byte) (n int, err error) {
-        // If there is no payload from the previous Read() calls, consume data off
-        // the network.  Not all data received is guaranteed to be usable payload,
-        // so do this in a loop till data is present or an error occurs.
-        var numPkts int
-        for conn.receiveDecodedBuffer.Len() == 0 {
-            numPkts, err = conn.readPackets()
-            if err == framing.ErrAgain {
-                // Don't proagate this back up the call stack if we happen to break
-                // out of the loop.
-                err = nil
-                continue
-            } else if err != nil {
-                break
-            }
+    // Generate the server handshake, and arm the base timeout.
+    hs := newServerHandshake(sf.nodeID, sf.identityKey, sessionKey)
+    if err := conn.Conn.SetDeadline(time.Now().Add(serverHandshakeTimeout)); err != nil {
+        return err
+    }
+
+    // Consume the client handshake.
+    var hsBuf [maxHandshakeLength]byte
+    for {
+        n, err := conn.Conn.Read(hsBuf[:])
+        if err != nil {
+            // The Read() could have returned data and an error, but there is
+            // no point in continuing on an EOF or whatever.
+            return err
+        }
+        conn.receiveBuffer.Write(hsBuf[:n])
+
+        seed, err := hs.parseClientHandshake(sf.replayFilter, conn.receiveBuffer.Bytes())
+        if err == ErrMarkNotFoundYet {
+            continue
+        } else if err != nil {
+            return err
+        }
+        conn.receiveBuffer.Reset()
+
+        if err := conn.Conn.SetDeadline(time.Time{}); err != nil {
+            return nil
         }
 
-        jammed = false
+        // Use the derived key material to intialize the link crypto.
+        okm := ntor.Kdf(seed, framing.KeyLength*2)
+        conn.encoder = framing.NewEncoder(okm[framing.KeyLength:])
+        conn.decoder = framing.NewDecoder(okm[:framing.KeyLength])
 
-        // Even if err is set, attempt to do the read anyway so that all decoded
-        // data gets relayed before the connection is torn down.
-        if conn.receiveDecodedBuffer.Len() > 0 {
-            var berr error
-            n, berr = conn.receiveDecodedBuffer.Read(b)
-            if err == nil {
-                // Only propagate berr if there are not more important (fatal)
-                // errors from the network/crypto/packet processing.
-                err = berr
-            }
+        break
+    }
+
+    // Since the current and only implementation always sends a PRNG seed for
+    // the length obfuscation, this makes the amount of data received from the
+    // server inconsistent with the length sent from the client.
+    //
+    // Rebalance this by tweaking the client mimimum padding/server maximum
+    // padding, and sending the PRNG seed unpadded (As in, treat the PRNG seed
+    // as part of the server response).  See inlineSeedFrameLength in
+    // handshake_ntor.go.
+
+    // Generate/send the response.
+    blob, err := hs.generateHandshake()
+    if err != nil {
+        return err
+    }
+    var frameBuf bytes.Buffer
+    if _, err = frameBuf.Write(blob); err != nil {
+        return err
+    }
+
+    // Send the PRNG seed as the first packet.
+    if err := conn.makePacket(&frameBuf, packetTypePrngSeed, sf.lenSeed.Bytes()[:], 0); err != nil {
+        return err
+    }
+    if _, err = conn.Conn.Write(frameBuf.Bytes()); err != nil {
+        return err
+    }
+
+    return nil
+}
+
+func (conn *obfs4Conn) Read(b []byte) (n int, err error) {
+    // If there is no payload from the previous Read() calls, consume data off
+    // the network.  Not all data received is guaranteed to be usable payload,
+    // so do this in a loop till data is present or an error occurs.
+    var numPkts int
+    for conn.receiveDecodedBuffer.Len() == 0 {
+        numPkts, err = conn.readPackets()
+        if err == framing.ErrAgain {
+            // Don't proagate this back up the call stack if we happen to break
+            // out of the loop.
+            err = nil
+            continue
+        } else if err != nil {
+            break
         }
+    }
 
-        log.Debugf("Read %d bytes", n)
-        if conn.iatMode == iatDF {
-            conn.Dispatch(numPkts * 4);
+    conn.jammed = false
+
+    // Even if err is set, attempt to do the read anyway so that all decoded
+    // data gets relayed before the connection is torn down.
+    if conn.receiveDecodedBuffer.Len() > 0 {
+        var berr error
+        n, berr = conn.receiveDecodedBuffer.Read(b)
+        if err == nil {
+            // Only propagate berr if there are not more important (fatal)
+            // errors from the network/crypto/packet processing.
+            err = berr
         }
+    }
 
+    log.Debugf("Read %d bytes", n)
+    if conn.iatMode == iatDF {
+        conn.writeBufferLock.Lock()
+        conn.Dispatch(numPkts * 4)
+        conn.writeBufferLock.Unlock()
+    }
+
+    return
+}
+
+func (conn *obfs4Conn) StartDispatcher() {
+    for {
+        conn.writeBufferLock.Lock()
+        if conn.jammed {
+            // log.Warnf("!!! Jammed! Dispatching all packets")
+            conn.Dispatch(0) // dispatch a single packet if we're jammed
+        }
+        if conn.writeBuffer.Len() > 0 {
+            conn.jammed = true
+        }
+        conn.writeBufferLock.Unlock()
+        time.Sleep(bufferCheck)
+    }
+}
+
+func (conn *obfs4Conn) Dispatch(numPkts int) (err error) {
+    if numPkts == 0 {
+        _, err = conn.Conn.Write(conn.writeBuffer.Bytes())
+        conn.writeBuffer.Reset()
         return
     }
 
-    func (conn *obfs4Conn) StartDispatcher() {
-        for {
-            // log.Debugf("Checking buffer every 100ms...")
-            if jammed {
-                log.Warnf("!!! Jammed! Dispatching all packets")
-                conn.Dispatch(0) // dispatch a single packet if we're jammed
-            }
-            if conn.writeBuffer.Len() > 0 {
-                jammed = true
-            }
-            time.Sleep(bufferCheck)
+    log.Debugf("Dispatching %d packets", numPkts)
+    var iatFrame [framing.MaximumSegmentLength]byte
+    n := 0
+    // conn.padBurst(conn.writeBuffer, numPkts * framing.MaximumSegmentLength)
+    for numPkts > 0 {
+        // similar to regular IAT mode
+        n, err = conn.writeBuffer.Read(iatFrame[:])
+        if err != nil { return err }
+        _, err = conn.Conn.Write(iatFrame[:n])
+        if err != nil { return err }
+
+        if n < framing.MaximumSegmentLength {
+            log.Warnf("Could not find enough data to write!")
         }
+        numPkts--
     }
+    return
+}
 
-    func (conn *obfs4Conn) Dispatch(numPkts int) (err error) {
-        if numPkts == 0 {
-            log.Debugf("Dispatching all packets")
-            _, err = conn.Conn.Write(conn.writeBuffer.Bytes())
-            conn.writeBuffer.Reset()
-            return
-        }
+func (conn *obfs4Conn) SendWithIAT(iatMode int, frameBuf *bytes.Buffer) (err error) {
+    var iatFrame [framing.MaximumSegmentLength]byte
+    for frameBuf.Len() > 0 {
+        iatWrLen := 0
 
-        log.Debugf("Dispatching %d packets", numPkts);
-        var iatFrame [framing.MaximumSegmentLength]byte
-        n := 0
-        // conn.padBurst(conn.writeBuffer, numPkts * framing.MaximumSegmentLength)
-        for numPkts > 0 {
-            // similar to regular IAT mode
-            n, err = conn.writeBuffer.Read(iatFrame[:])
-            if err != nil { return err }
-            _, err = conn.Conn.Write(iatFrame[:n])
-            if err != nil { return err }
+        switch iatMode {
+        case iatEnabled:
+            // Standard (ScrambleSuit-style) IAT obfuscation optimizes for
+            // bulk transport and will write ~MTU sized frames when
+            // possible.
+            iatWrLen, err = frameBuf.Read(iatFrame[:])
 
-            if n < framing.MaximumSegmentLength {
-                log.Warnf("Could not find enough data to write!")
-            }
-            numPkts--;
-        }
-        return
-    }
-
-    func (conn *obfs4Conn) SendWithIAT(iatMode int, frameBuf *bytes.Buffer) (err error) {
-        var iatFrame [framing.MaximumSegmentLength]byte
-        for frameBuf.Len() > 0 {
-            iatWrLen := 0
-
-            switch iatMode {
-            case iatEnabled:
-                // Standard (ScrambleSuit-style) IAT obfuscation optimizes for
-                // bulk transport and will write ~MTU sized frames when
-                // possible.
-                iatWrLen, err = frameBuf.Read(iatFrame[:])
-
-            case iatParanoid:
-                // Paranoid IAT obfuscation throws performance out of the
-                // window and will sample the length distribution every time a
-                // write is scheduled.
-                targetLen := conn.lenDist.Sample()
-                if frameBuf.Len() < targetLen {
-                    // There's not enough data buffered for the target write,
-                    // so padding must be inserted.
-                    if err = conn.padBurst(frameBuf, targetLen); err != nil {
-                        return err
-                    }
-                    if frameBuf.Len() != targetLen {
-                        // Ugh, padding came out to a value that required more
-                        // than one frame, this is relatively unlikely so just
-                        // resample since there's enough data to ensure that
-                        // the next sample will be written.
-                        continue
-                    }
+        case iatParanoid:
+            // Paranoid IAT obfuscation throws performance out of the
+            // window and will sample the length distribution every time a
+            // write is scheduled.
+            targetLen := conn.lenDist.Sample()
+            if frameBuf.Len() < targetLen {
+                // There's not enough data buffered for the target write,
+                // so padding must be inserted.
+                if err = conn.padBurst(frameBuf, targetLen); err != nil {
+                    return err
                 }
-                iatWrLen, err = frameBuf.Read(iatFrame[:targetLen])
+                if frameBuf.Len() != targetLen {
+                    // Ugh, padding came out to a value that required more
+                    // than one frame, this is relatively unlikely so just
+                    // resample since there's enough data to ensure that
+                    // the next sample will be written.
+                    continue
+                }
             }
-
-            if err != nil {
-                return err
-            } else if iatWrLen == 0 {
-                panic(fmt.Sprintf("BUG: Write(), iat length was 0"))
-            }
-
-            log.Debugf("Sending packet of iatWrLen %d", iatWrLen)
-
-            // Calculate the delay.  The delay resolution is 100 usec, leading
-            // to a maximum delay of 10 msec.
-            iatDelta := time.Duration(conn.iatDist.Sample() * 100)
-
-            // Write then sleep.
-            _, err = conn.Conn.Write(iatFrame[:iatWrLen])
-            if err != nil {
-                return err
-            }
-            time.Sleep(iatDelta * time.Microsecond)
+            iatWrLen, err = frameBuf.Read(iatFrame[:targetLen])
         }
+
+        if err != nil {
+            return err
+        } else if iatWrLen == 0 {
+            panic(fmt.Sprintf("BUG: Write(), iat length was 0"))
+        }
+
+        log.Debugf("Sending packet of iatWrLen %d", iatWrLen)
+
+        // Calculate the delay.  The delay resolution is 100 usec, leading
+        // to a maximum delay of 10 msec.
+        iatDelta := time.Duration(conn.iatDist.Sample() * 100)
+
+        // Write then sleep.
+        _, err = conn.Conn.Write(iatFrame[:iatWrLen])
+        if err != nil {
+            return err
+        }
+        time.Sleep(iatDelta * time.Microsecond)
+    }
+    return
+}
+func (conn *obfs4Conn) Write(b []byte) (n int, err error) {
+    chopBuf := bytes.NewBuffer(b)
+    var payload [maxPacketPayloadLength]byte
+    var frameBuf bytes.Buffer
+
+    log.Debugf("Writing %d bytes", len(b))
+
+    // Chop the pending data into payload frames.
+    for chopBuf.Len() > 0 {
+        // Send maximum sized frames.
+        rdLen := 0
+        rdLen, err = chopBuf.Read(payload[:])
+        if err != nil {
+            return 0, err
+        } else if rdLen == 0 {
+            panic(fmt.Sprintf("BUG: Write(), chopping length was 0"))
+        }
+        n += rdLen
+
+        err = conn.makePacket(&frameBuf, packetTypePayload, payload[:rdLen], 0)
+        if err != nil {
+            return 0, err
+        }
+    }
+
+    if conn.iatMode != iatParanoid {
+        // For non-paranoid IAT, pad once per burst.  Paranoid IAT handles
+        // things differently.
+        if err = conn.padBurst(&frameBuf, conn.lenDist.Sample()); err != nil {
+            return 0, err
+        }
+    }
+
+    // Write the pending data onto the network.  Partial writes are fatal,
+    // because the frame encoder state is advanced, and the code doesn't keep
+    // frameBuf around.  In theory, write timeouts and whatnot could be
+    // supported if this wasn't the case, but that complicates the code.
+    if conn.iatMode != iatNone {
+        if conn.iatMode == iatDF {
+            // Buffer everything, wait to send
+            conn.writeBufferLock.Lock();
+            conn.writeBuffer.Write(frameBuf.Bytes())
+            conn.writeBufferLock.Unlock();
+            log.Debugf("Successfully buffered %d bytes", frameBuf.Len())
+        } else if err = conn.SendWithIAT(conn.iatMode, &frameBuf); err != nil {
+            return 0, err
+        }
+    } else {
+        _, err = conn.Conn.Write(frameBuf.Bytes())
+    }
+
+    return
+}
+
+func (conn *obfs4Conn) SetDeadline(t time.Time) error {
+    return syscall.ENOTSUP
+}
+
+func (conn *obfs4Conn) SetWriteDeadline(t time.Time) error {
+    return syscall.ENOTSUP
+}
+
+func (conn *obfs4Conn) closeAfterDelay(sf *obfs4ServerFactory, startTime time.Time) {
+    // I-it's not like I w-wanna handshake with you or anything.  B-b-baka!
+    defer conn.Conn.Close()
+
+    delay := time.Duration(sf.closeDelay)*time.Second + serverHandshakeTimeout
+    deadline := startTime.Add(delay)
+    if time.Now().After(deadline) {
         return
     }
-    func (conn *obfs4Conn) Write(b []byte) (n int, err error) {
-        chopBuf := bytes.NewBuffer(b)
-        var payload [maxPacketPayloadLength]byte
-        var frameBuf bytes.Buffer
 
-        log.Debugf("Writing %d bytes", len(b));
-
-        // Chop the pending data into payload frames.
-        for chopBuf.Len() > 0 {
-            // Send maximum sized frames.
-            rdLen := 0
-            rdLen, err = chopBuf.Read(payload[:])
-            if err != nil {
-                return 0, err
-            } else if rdLen == 0 {
-                panic(fmt.Sprintf("BUG: Write(), chopping length was 0"))
-            }
-            n += rdLen
-
-            err = conn.makePacket(&frameBuf, packetTypePayload, payload[:rdLen], 0)
-            if err != nil {
-                return 0, err
-            }
-        }
-
-        if conn.iatMode != iatParanoid {
-            // For non-paranoid IAT, pad once per burst.  Paranoid IAT handles
-            // things differently.
-            if err = conn.padBurst(&frameBuf, conn.lenDist.Sample()); err != nil {
-                return 0, err
-            }
-        }
-
-        // Write the pending data onto the network.  Partial writes are fatal,
-        // because the frame encoder state is advanced, and the code doesn't keep
-        // frameBuf around.  In theory, write timeouts and whatnot could be
-        // supported if this wasn't the case, but that complicates the code.
-        if conn.iatMode != iatNone {
-            if conn.iatMode == iatDF {
-                // Buffer everything, wait to send
-                conn.writeBuffer.Write(frameBuf.Bytes())
-                log.Debugf("Successfully buffered %d bytes", frameBuf.Len())
-            } else if err = conn.SendWithIAT(conn.iatMode, &frameBuf); err != nil {
-                return 0, err
-            }
-        } else {
-            _, err = conn.Conn.Write(frameBuf.Bytes())
-        }
-
+    if err := conn.Conn.SetReadDeadline(deadline); err != nil {
         return
     }
 
-    func (conn *obfs4Conn) SetDeadline(t time.Time) error {
-        return syscall.ENOTSUP
+    // Consume and discard data on this connection until the specified interval
+    // passes.
+    _, _ = io.Copy(ioutil.Discard, conn.Conn)
+}
+
+func (conn *obfs4Conn) padBurst(burst *bytes.Buffer, toPadTo int) (err error) {
+    tailLen := burst.Len() % framing.MaximumSegmentLength
+
+    padLen := 0
+    if toPadTo >= tailLen {
+        padLen = toPadTo - tailLen
+    } else {
+        padLen = (framing.MaximumSegmentLength - tailLen) + toPadTo
     }
 
-    func (conn *obfs4Conn) SetWriteDeadline(t time.Time) error {
-        return syscall.ENOTSUP
-    }
-
-    func (conn *obfs4Conn) closeAfterDelay(sf *obfs4ServerFactory, startTime time.Time) {
-        // I-it's not like I w-wanna handshake with you or anything.  B-b-baka!
-        defer conn.Conn.Close()
-
-        delay := time.Duration(sf.closeDelay)*time.Second + serverHandshakeTimeout
-        deadline := startTime.Add(delay)
-        if time.Now().After(deadline) {
+    if padLen > headerLength {
+        err = conn.makePacket(burst, packetTypePayload, []byte{},
+        uint16(padLen-headerLength))
+        if err != nil {
             return
         }
-
-        if err := conn.Conn.SetReadDeadline(deadline); err != nil {
+    } else if padLen > 0 {
+        err = conn.makePacket(burst, packetTypePayload, []byte{},
+        maxPacketPayloadLength)
+        if err != nil {
             return
         }
-
-        // Consume and discard data on this connection until the specified interval
-        // passes.
-        _, _ = io.Copy(ioutil.Discard, conn.Conn)
-    }
-
-    func (conn *obfs4Conn) padBurst(burst *bytes.Buffer, toPadTo int) (err error) {
-        tailLen := burst.Len() % framing.MaximumSegmentLength
-
-        padLen := 0
-        if toPadTo >= tailLen {
-            padLen = toPadTo - tailLen
-        } else {
-            padLen = (framing.MaximumSegmentLength - tailLen) + toPadTo
+        err = conn.makePacket(burst, packetTypePayload, []byte{},
+        uint16(padLen))
+        if err != nil {
+            return
         }
-
-        if padLen > headerLength {
-            err = conn.makePacket(burst, packetTypePayload, []byte{},
-            uint16(padLen-headerLength))
-            if err != nil {
-                return
-            }
-        } else if padLen > 0 {
-            err = conn.makePacket(burst, packetTypePayload, []byte{},
-            maxPacketPayloadLength)
-            if err != nil {
-                return
-            }
-            err = conn.makePacket(burst, packetTypePayload, []byte{},
-            uint16(padLen))
-            if err != nil {
-                return
-            }
-        }
-
-        return
     }
 
-    func init() {
-        flag.BoolVar(&biasedDist, biasCmdArg, false, "Enable obfs4 using ScrambleSuit style table generation")
-    }
+    return
+}
 
-    var _ base.ClientFactory = (*obfs4ClientFactory)(nil)
-    var _ base.ServerFactory = (*obfs4ServerFactory)(nil)
-    var _ base.Transport = (*Transport)(nil)
-    var _ net.Conn = (*obfs4Conn)(nil)
+func init() {
+    flag.BoolVar(&biasedDist, biasCmdArg, false, "Enable obfs4 using ScrambleSuit style table generation")
+}
+
+var _ base.ClientFactory = (*obfs4ClientFactory)(nil)
+var _ base.ServerFactory = (*obfs4ServerFactory)(nil)
+var _ base.Transport = (*Transport)(nil)
+var _ net.Conn = (*obfs4Conn)(nil)
