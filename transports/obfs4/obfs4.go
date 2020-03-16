@@ -527,7 +527,7 @@ func (conn *obfs4Conn) Read(b []byte) (n int, err error) {
     log.Debugf("Read %d bytes", n)
     if conn.iatMode == iatDF {
         conn.writeBufferLock.Lock()
-        conn.Dispatch(numPkts * 4)
+        conn.Dispatch(numPkts * 1)
         conn.writeBufferLock.Unlock()
     }
 
@@ -559,7 +559,13 @@ func (conn *obfs4Conn) Dispatch(numPkts int) (err error) {
     log.Debugf("Dispatching %d packets", numPkts)
     var iatFrame [framing.MaximumSegmentLength]byte
     n := 0
-    // conn.padBurst(conn.writeBuffer, numPkts * framing.MaximumSegmentLength)
+    if conn.writeBuffer.Len() < numPkts * framing.MaximumSegmentLength {
+        diff := numPkts * framing.MaximumSegmentLength
+        for diff > 0 {
+            err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, maxPacketPayloadLength)
+            diff -= framing.MaximumSegmentLength
+        }
+    }
     for numPkts > 0 {
         // similar to regular IAT mode
         n, err = conn.writeBuffer.Read(iatFrame[:])
