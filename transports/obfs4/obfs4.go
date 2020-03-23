@@ -71,7 +71,7 @@ const (
     serverHandshakeTimeout = time.Duration(30) * time.Second
     replayTTL              = time.Duration(3) * time.Hour
 
-    bufferCheck            = time.Duration(500) * time.Millisecond
+    bufferCheck            = time.Duration(100) * time.Millisecond
 
     maxIATDelay   = 100
     maxCloseDelay = 60
@@ -531,11 +531,11 @@ func (conn *obfs4Conn) Read(b []byte) (n int, err error) {
     }
 
     log.Debugf("Decoded %d bytes", n)
-    if conn.iatMode == iatDF {
-        conn.writeBufferLock.Lock()
-        conn.Dispatch(10)
-        conn.writeBufferLock.Unlock()
-    }
+    // if conn.iatMode == iatDF {
+    //     conn.writeBufferLock.Lock()
+    //     conn.Dispatch(10)
+    //     conn.writeBufferLock.Unlock()
+    // }
 
     return
 }
@@ -543,13 +543,14 @@ func (conn *obfs4Conn) Read(b []byte) (n int, err error) {
 func (conn *obfs4Conn) StartDispatcher() {
     for {
         conn.writeBufferLock.Lock()
-        if conn.jammed {
-            log.Warnf("!!! Jammed! Dispatching all packets")
-            conn.Dispatch(0) // dispatch all packets if we're jammed
-        }
-        if conn.writeBuffer.Len() > 0 {
-            conn.jammed = true
-        }
+        // if conn.jammed {
+        //     log.Warnf("!!! Jammed! Dispatching all packets")
+        //     conn.Dispatch(0) // dispatch all packets if we're jammed
+        // }
+        // if conn.writeBuffer.Len() > 0 {
+        //     conn.jammed = true
+        // }
+        conn.Dispatch(8)
         conn.writeBufferLock.Unlock()
         time.Sleep(bufferCheck)
     }
