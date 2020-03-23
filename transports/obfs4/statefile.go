@@ -160,7 +160,7 @@ func serverStateFromJSONServerState(stateDir string, js *jsonServerState) (*obfs
 	if st.drbgSeed, err = drbg.SeedFromHex(js.DrbgSeed); err != nil {
 		return nil, err
 	}
-	if js.IATMode < iatNone || js.IATMode > iatParanoid {
+	if js.IATMode < iatNone || js.IATMode > iatDF {
 		return nil, fmt.Errorf("invalid iat-mode '%d'", js.IATMode)
 	}
 	st.iatMode = js.IATMode

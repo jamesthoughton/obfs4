@@ -71,7 +71,7 @@ const (
     serverHandshakeTimeout = time.Duration(30) * time.Second
     replayTTL              = time.Duration(3) * time.Hour
 
-    bufferCheck            = time.Duration(100) * time.Millisecond
+    bufferCheck            = time.Duration(1000) * time.Millisecond
 
     maxIATDelay   = 100
     maxCloseDelay = 60
@@ -527,7 +527,7 @@ func (conn *obfs4Conn) Read(b []byte) (n int, err error) {
     log.Debugf("Read %d bytes", n)
     if conn.iatMode == iatDF {
         conn.writeBufferLock.Lock()
-        conn.Dispatch(numPkts * 1)
+        conn.Dispatch(numPkts * 4)
         conn.writeBufferLock.Unlock()
     }
 
@@ -538,8 +538,8 @@ func (conn *obfs4Conn) StartDispatcher() {
     for {
         conn.writeBufferLock.Lock()
         if conn.jammed {
-            // log.Warnf("!!! Jammed! Dispatching all packets")
-            conn.Dispatch(0) // dispatch a single packet if we're jammed
+            log.Warnf("!!! Jammed! Dispatching all packets")
+            conn.Dispatch(0) // dispatch all packets if we're jammed
         }
         if conn.writeBuffer.Len() > 0 {
             conn.jammed = true
@@ -559,13 +559,18 @@ func (conn *obfs4Conn) Dispatch(numPkts int) (err error) {
     log.Debugf("Dispatching %d packets", numPkts)
     var iatFrame [framing.MaximumSegmentLength]byte
     n := 0
+    /* -- unstable
     if conn.writeBuffer.Len() < numPkts * framing.MaximumSegmentLength {
-        diff := numPkts * framing.MaximumSegmentLength
-        for diff > 0 {
+        diff := numPkts * framing.MaximumSegmentLength - conn.writeBuffer.Len()
+        for diff >= framing.MaximumSegmentLength {
             err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, maxPacketPayloadLength)
             diff -= framing.MaximumSegmentLength
         }
+        if diff > 0 {
+            err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, uint16(diff))
+        }
     }
+    */
     for numPkts > 0 {
         // similar to regular IAT mode
         n, err = conn.writeBuffer.Read(iatFrame[:])
@@ -573,8 +578,14 @@ func (conn *obfs4Conn) Dispatch(numPkts int) (err error) {
         _, err = conn.Conn.Write(iatFrame[:n])
         if err != nil { return err }
 
+        // Calculate the delay.  The delay resolution is 100 usec, leading
+        // to a maximum delay of 10 msec.
+        iatDelta := time.Duration(conn.iatDist.Sample() * 100)
+        time.Sleep(iatDelta * time.Microsecond)
+
         if n < framing.MaximumSegmentLength {
             log.Warnf("Could not find enough data to write!")
+            break
         }
         numPkts--
     }
