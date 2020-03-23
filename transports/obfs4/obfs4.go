@@ -71,7 +71,7 @@ const (
     serverHandshakeTimeout = time.Duration(30) * time.Second
     replayTTL              = time.Duration(3) * time.Hour
 
-    bufferCheck            = time.Duration(250) * time.Millisecond
+    bufferCheck            = time.Duration(150) * time.Millisecond
 
     maxIATDelay   = 100
     maxCloseDelay = 60
@@ -589,13 +589,16 @@ func (conn *obfs4Conn) Dispatch(numPkts int) (err error) {
         _, err = conn.Conn.Write(iatFrame[:n])
         if err != nil { return err }
 
-        if n < framing.MaximumSegmentLength {
-            log.Warnf("Still had %d packets left to write", numPkts)
-            break
+        if n < framing.MaximumSegmentLength - headerLength {
+            // log.Warnf("Still had %d packets left to write", numPkts)
+            err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, uint16(framing.MaximumSegmentLength - headerLength - n))
+            if err != nil { return err }
         }
         numPkts--
     }
-    log.Warnf("Sent all packets!")
+    if numPkts == 0 {
+        log.Warnf("Sent all packets!")
+    }
     return
 }
 
