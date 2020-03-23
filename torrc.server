@@ -1,0 +1,13 @@
+Log notice syslog
+Log notice stderr
+
+DataDirectory tor-data/
+
+ORPort 40001
+
+ServerTransportPlugin obfs4 exec /home/james/obfs4/obfs4proxy/obfs4proxy -enableLogging -logLevel DEBUG
+ServerTransportListenAddr obfs4 0.0.0.0:40000
+
+ExtORPort auto
+
+ContactInfo tor@baryon.org

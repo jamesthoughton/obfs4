@@ -1,0 +1,10 @@
+Log notice syslog
+Log notice stderr
+
+DataDirectory tor-data/
+
+UseBridges 1
+
+ClientTransportPlugin obfs5 exec /home/james/obfs4/obfs4proxy/obfs4proxy -enableLogging -logLevel DEBUG
+
+Bridge obfs5 64.227.28.1:40000
