@@ -71,7 +71,7 @@ const (
     serverHandshakeTimeout = time.Duration(30) * time.Second
     replayTTL              = time.Duration(3) * time.Hour
 
-    bufferCheck            = time.Duration(1000) * time.Millisecond
+    bufferCheck            = time.Duration(500) * time.Millisecond
 
     maxIATDelay   = 100
     maxCloseDelay = 60
@@ -516,6 +516,8 @@ func (conn *obfs4Conn) Read(b []byte) (n int, err error) {
 
     conn.jammed = false
 
+    log.Debugf("Read %d packets", numPkts)
+
     // Even if err is set, attempt to do the read anyway so that all decoded
     // data gets relayed before the connection is torn down.
     if conn.receiveDecodedBuffer.Len() > 0 {
@@ -528,10 +530,10 @@ func (conn *obfs4Conn) Read(b []byte) (n int, err error) {
         }
     }
 
-    log.Debugf("Read %d bytes", n)
+    log.Debugf("Decoded %d bytes", n)
     if conn.iatMode == iatDF {
         conn.writeBufferLock.Lock()
-        conn.Dispatch(numPkts * 4)
+        conn.Dispatch(10)
         conn.writeBufferLock.Unlock()
     }
 
