@@ -432,6 +432,10 @@ func (conn *obfs4Conn) serverHandshake(sf *obfs4ServerFactory, sessionKey *ntor.
         return err
     }
 
+    if conn.iatMode == iatDF {
+        go conn.StartDispatcher()
+    }
+
     // Consume the client handshake.
     var hsBuf [maxHandshakeLength]byte
     for {
