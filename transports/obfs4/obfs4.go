@@ -597,7 +597,7 @@ func (conn *obfs4Conn) Dispatch(numPkts int) (err error) {
     }
 
     for numPkts > 0 {
-        err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, 0)
+        err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, maxPacketPayloadLength)
         if err != nil { return err }
         n, err = conn.writeBuffer.Read(iatFrame[:])
         if err != nil { return err }
