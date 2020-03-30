@@ -71,7 +71,8 @@ const (
     serverHandshakeTimeout = time.Duration(30) * time.Second
     replayTTL              = time.Duration(3) * time.Hour
 
-    bufferCheck            = time.Duration(150) * time.Millisecond
+    bufferCheck            = time.Duration(100) * time.Millisecond
+    packetsToDispatch      = 16
 
     maxIATDelay   = 100
     maxCloseDelay = 60
@@ -550,7 +551,7 @@ func (conn *obfs4Conn) StartDispatcher() {
         // if conn.writeBuffer.Len() > 0 {
         //     conn.jammed = true
         // }
-        conn.Dispatch(8)
+        conn.Dispatch(packetsToDispatch)
         conn.writeBufferLock.Unlock()
         time.Sleep(bufferCheck)
     }
