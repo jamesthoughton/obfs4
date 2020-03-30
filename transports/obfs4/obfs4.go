@@ -291,6 +291,7 @@ func (sf *obfs4ServerFactory) WrapConn(conn net.Conn) (net.Conn, error) {
         readBuffer: make([]byte, consumeReadSize),
         writeBuffer: bytes.NewBuffer(nil),
         jammed: true,
+        dataMultiplier: 0,
     }
 
     startTime := time.Now()
@@ -324,6 +325,7 @@ type obfs4Conn struct {
     decoder *framing.Decoder
 
     writeBufferLock      sync.Mutex
+    dataMultiplier       float32
 }
 
 func newObfs4ClientConn(conn net.Conn, args *obfs4ClientArgs) (c *obfs4Conn, err error) {
@@ -355,6 +357,7 @@ func newObfs4ClientConn(conn net.Conn, args *obfs4ClientArgs) (c *obfs4Conn, err
         readBuffer: make([]byte, consumeReadSize),
         writeBuffer: bytes.NewBuffer(nil),
         jammed: true,
+        dataMultiplier: 0,
     }
 
     // Start the handshake timeout.
@@ -392,6 +395,7 @@ func (conn *obfs4Conn) clientHandshake(nodeID *ntor.NodeID, peerIdentityKey *nto
 
     if conn.iatMode == iatDF {
         go conn.StartDispatcher()
+        go conn.StartResampler()
     }
 
     // Consume the server handshake.
@@ -435,6 +439,7 @@ func (conn *obfs4Conn) serverHandshake(sf *obfs4ServerFactory, sessionKey *ntor.
 
     if conn.iatMode == iatDF {
         go conn.StartDispatcher()
+        go conn.StartResampler()
     }
 
     // Consume the client handshake.
@@ -539,6 +544,28 @@ func (conn *obfs4Conn) Read(b []byte) (n int, err error) {
     // }
 
     return
+}
+
+func (conn *obfs4Conn) AddExtraPackets(totalLen int) (err error) {
+    // writeBuffer lock is held
+    n := uint16(conn.dataMultiplier * float32(totalLen))
+    log.Debugf("Buffered %d extra bytes", n)
+    for n > maxPacketPayloadLength {
+        err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, maxPacketPayloadLength)
+        if err != nil { return err }
+        n -= maxPacketPayloadLength
+    }
+    err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, n)
+    if err != nil { return err }
+    return
+}
+
+func (conn *obfs4Conn) StartResampler() {
+    for {
+        conn.dataMultiplier = 2 * float32(conn.lenDist.Sample())/framing.MaximumSegmentLength // random [0-2]
+        log.Debugf("Setting data multiplier to %f", conn.dataMultiplier)
+        time.Sleep(5 * time.Minute)
+    }
 }
 
 func (conn *obfs4Conn) StartDispatcher() {
@@ -668,6 +695,8 @@ func (conn *obfs4Conn) Write(b []byte) (n int, err error) {
     var payload [maxPacketPayloadLength]byte
     var frameBuf bytes.Buffer
 
+    totalLen := len(b)
+
     log.Debugf("Writing %d bytes", len(b))
 
     // Chop the pending data into payload frames.
@@ -705,6 +734,8 @@ func (conn *obfs4Conn) Write(b []byte) (n int, err error) {
             // Buffer everything, wait to send
             conn.writeBufferLock.Lock();
             conn.writeBuffer.Write(frameBuf.Bytes())
+            err = conn.AddExtraPackets(totalLen)
+            if err != nil { return 0, err }
             conn.writeBufferLock.Unlock();
             log.Debugf("Successfully buffered %d bytes", frameBuf.Len())
         } else if err = conn.SendWithIAT(conn.iatMode, &frameBuf); err != nil {
