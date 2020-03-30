@@ -67,12 +67,12 @@ const (
 
     seedLength             = drbg.SeedLength
     headerLength           = framing.FrameOverhead + packetOverhead
-    clientHandshakeTimeout = time.Duration(60) * time.Second
-    serverHandshakeTimeout = time.Duration(30) * time.Second
+    clientHandshakeTimeout = time.Duration(600) * time.Second
+    serverHandshakeTimeout = time.Duration(300) * time.Second
     replayTTL              = time.Duration(3) * time.Hour
 
-    bufferCheck            = time.Duration(1000) * time.Millisecond
-    packetsToDispatch      = 64
+    bufferCheck            = time.Duration(50) * time.Millisecond
+    packetsToDispatch      = 8
 
     maxIATDelay   = 100
     maxCloseDelay = 60
@@ -591,11 +591,18 @@ func (conn *obfs4Conn) Dispatch(numPkts int) (err error) {
         if err != nil { return err }
 
         if n < maxPacketPayloadLength {
-            // log.Warnf("Still had %d packets left to write", numPkts)
-            err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, uint16(maxPacketPayloadLength - n))
-            // err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, uint16(0))
-            if err != nil { return err }
+            break
         }
+        numPkts--
+    }
+
+    for numPkts > 0 {
+        err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, 0)
+        if err != nil { return err }
+        n, err = conn.writeBuffer.Read(iatFrame[:])
+        if err != nil { return err }
+        _, err = conn.Conn.Write(iatFrame[:n])
+        if err != nil { return err }
         numPkts--
     }
     return
