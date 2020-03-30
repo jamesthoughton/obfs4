@@ -71,8 +71,8 @@ const (
     serverHandshakeTimeout = time.Duration(30) * time.Second
     replayTTL              = time.Duration(3) * time.Hour
 
-    bufferCheck            = time.Duration(100) * time.Millisecond
-    packetsToDispatch      = 16
+    bufferCheck            = time.Duration(1000) * time.Millisecond
+    packetsToDispatch      = 64
 
     maxIATDelay   = 100
     maxCloseDelay = 60
