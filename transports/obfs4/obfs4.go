@@ -567,7 +567,7 @@ func (conn *obfs4Conn) Dispatch(numPkts int) (err error) {
         return
     }
 
-    log.Debugf("Dispatching %d packets", numPkts)
+    // log.Debugf("Dispatching %d packets", numPkts)
     var iatFrame [framing.MaximumSegmentLength]byte
     n := 0
     /* -- unstable
@@ -589,15 +589,13 @@ func (conn *obfs4Conn) Dispatch(numPkts int) (err error) {
         _, err = conn.Conn.Write(iatFrame[:n])
         if err != nil { return err }
 
-        if n < framing.MaximumSegmentLength - headerLength {
+        if n < maxPacketPayloadLength {
             // log.Warnf("Still had %d packets left to write", numPkts)
-            err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, uint16(framing.MaximumSegmentLength - headerLength - n))
+            err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, uint16(maxPacketPayloadLength - n))
+            // err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, uint16(0))
             if err != nil { return err }
         }
         numPkts--
-    }
-    if numPkts == 0 {
-        log.Warnf("Sent all packets!")
     }
     return
 }
