@@ -613,14 +613,24 @@ func (conn *obfs4Conn) Dispatch(numPkts int) (err error) {
     for numPkts > 0 {
         // similar to regular IAT mode
         n, err = conn.writeBuffer.Read(iatFrame[:])
+
+        if n == 0 {
+            break
+        }
+
         if err != nil { return err }
         _, err = conn.Conn.Write(iatFrame[:n])
         if err != nil { return err }
 
+        numPkts--
+
         if n < maxPacketPayloadLength {
             break
         }
-        numPkts--
+    }
+
+    if numPkts == packetsToDispatch {
+        return
     }
 
     for numPkts > 0 {
