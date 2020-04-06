@@ -549,11 +549,17 @@ func (conn *obfs4Conn) Read(b []byte) (n int, err error) {
 func (conn *obfs4Conn) AddExtraPackets(totalLen int) (err error) {
     // writeBuffer lock is held
     n := uint16(conn.dataMultiplier * float32(totalLen))
+    if n == 0 {
+        return
+    }
     log.Debugf("Buffered %d extra bytes", n)
     for n > maxPacketPayloadLength {
         err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, maxPacketPayloadLength)
         if err != nil { return err }
         n -= maxPacketPayloadLength
+    }
+    if n == 0 {
+        return
     }
     err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, n)
     if err != nil { return err }
@@ -633,11 +639,14 @@ func (conn *obfs4Conn) Dispatch(numPkts int) (err error) {
         return
     }
 
+    return
+
     for numPkts > 0 {
-        err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, maxPacketPayloadLength)
+        err = conn.makePacket(conn.writeBuffer, packetTypePayload, []byte{}, 0)
         if err != nil { return err }
         n, err = conn.writeBuffer.Read(iatFrame[:])
         if err != nil { return err }
+        if n == 0 { return }
         _, err = conn.Conn.Write(iatFrame[:n])
         if err != nil { return err }
         numPkts--
