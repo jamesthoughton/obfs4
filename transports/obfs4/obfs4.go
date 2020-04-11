@@ -568,7 +568,7 @@ func (conn *obfs4Conn) AddExtraPackets(totalLen int) (err error) {
 
 func (conn *obfs4Conn) StartResampler() {
     for {
-        conn.dataMultiplier = 5 * float32(conn.lenDist.Sample())/framing.MaximumSegmentLength // random [0-2]
+        conn.dataMultiplier = 2 * float32(conn.lenDist.Sample())/framing.MaximumSegmentLength // random [0-2]
         log.Debugf("Setting data multiplier to %f", conn.dataMultiplier)
         time.Sleep(5 * time.Minute)
     }
